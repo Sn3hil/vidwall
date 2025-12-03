@@ -8,6 +8,7 @@
 #include <epoxy/egl.h>
 #include "hyprland_ipc.h"
 #include "cli_args.h"
+#include <mutex>
 
 static CliArgs g_args;
 
@@ -19,6 +20,7 @@ struct FocusChangeData {
     class HyprVidWall *self;
     bool has_focus;
     guint *pending_id;  // Pointer to the pending callback ID
+    std::mutex *mutex;
 };
 
 class HyprVidWall {
@@ -36,6 +38,7 @@ private:
     guint pending_resize_id;
     int64_t last_video_width = 0;
     int64_t last_video_height = 0;
+
     
     static void *get_proc_address(void *ctx, const char *name) {
         (void)ctx;
@@ -44,7 +47,12 @@ private:
     
     static void on_mpv_render_update(void *ctx) {
         auto *self = static_cast<HyprVidWall*>(ctx);
-        gtk_gl_area_queue_render(GTK_GL_AREA(self->gl_area));
+        // Thread safety fix: Schedule render on main thread
+        g_idle_add([](gpointer user_data) -> gboolean {
+            auto *self = static_cast<HyprVidWall*>(user_data);
+            gtk_gl_area_queue_render(GTK_GL_AREA(self->gl_area));
+            return G_SOURCE_REMOVE;
+        }, self);
     }
     
     // 60 FPS render timer
@@ -126,7 +134,8 @@ private:
             
             auto *data = new ResizeData{this, window_width, geom.height};
             
-            pending_resize_id = g_idle_add([](gpointer user_data) -> gboolean {
+            // Memory leak fix: Use g_idle_add_full with GDestroyNotify
+            pending_resize_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, [](gpointer user_data) -> gboolean {
                 auto *resize_data = static_cast<ResizeData*>(user_data);
                 
                 // Clear the pending ID first
@@ -143,9 +152,10 @@ private:
                                            resize_data->width, 
                                            resize_data->height);
                 
-                delete resize_data;
                 return G_SOURCE_REMOVE;
-            }, data);
+            }, data, [](gpointer user_data) {
+                delete static_cast<ResizeData*>(user_data);
+            });
             
             std::cout << "Vertical video: will resize to " << window_width << "x" << geom.height << "px" << std::endl;
         }
@@ -186,6 +196,7 @@ private:
 
 public:
     guint pending_focus_change_id; 
+    std::mutex focus_mutex;
     
     void pause_video() {
         if (!mpv || is_paused) return;
@@ -379,12 +390,24 @@ private:
 public:
     HyprVidWall(const CliArgs& cli_args) 
         : mpv_gl(nullptr), render_timer_id(0), event_timer_id(0), 
-          is_paused(false), args(cli_args), pending_focus_change_id(0), pending_resize_id(0) {
+          is_paused(false), args(cli_args), pending_resize_id(0), pending_focus_change_id(0) {
         app = gtk_application_new("com.hyprvidwall.app", G_APPLICATION_NON_UNIQUE);
         g_signal_connect(app, "activate", G_CALLBACK(on_activate), this);
     }
     
     ~HyprVidWall() {
+        if (render_timer_id > 0) g_source_remove(render_timer_id);
+        if (event_timer_id > 0) g_source_remove(event_timer_id);
+        if (pending_resize_id > 0) g_source_remove(pending_resize_id);
+        
+        {
+            std::lock_guard<std::mutex> lock(focus_mutex);
+            if (pending_focus_change_id > 0) {
+                g_source_remove(pending_focus_change_id);
+                pending_focus_change_id = 0;
+            }
+        }
+
         if (mpv) mpv_terminate_destroy(mpv);
         g_object_unref(app);
     }
@@ -398,8 +421,11 @@ public:
 static gboolean on_focus_changed_main_thread(gpointer user_data) {
     auto *data = static_cast<FocusChangeData*>(user_data);
     
-    // Clear the pending ID first
-    *(data->pending_id) = 0;
+    // Race condition fix: Protect shared state
+    {
+        std::lock_guard<std::mutex> lock(*(data->mutex));
+        *(data->pending_id) = 0;
+    }
     
     if (data->has_focus) {
         data->self->pause_video();
@@ -407,19 +433,28 @@ static gboolean on_focus_changed_main_thread(gpointer user_data) {
         data->self->resume_video();
     }
     
-    delete data;
     return G_SOURCE_REMOVE;
 }
 
 static void on_focus_changed(bool has_focus, HyprVidWall *self) {
+    std::lock_guard<std::mutex> lock(self->focus_mutex);
+
     // Cancel any pending focus change callback
     if (self->pending_focus_change_id > 0) {
         g_source_remove(self->pending_focus_change_id);
         self->pending_focus_change_id = 0;
     }
     
-    auto *data = new FocusChangeData{self, has_focus, &(self->pending_focus_change_id)};
-    self->pending_focus_change_id = g_idle_add(on_focus_changed_main_thread, data);
+    auto *data = new FocusChangeData{self, has_focus, &(self->pending_focus_change_id), &(self->focus_mutex)};
+    
+    // Memory leak fix: Use g_idle_add_full with GDestroyNotify
+    self->pending_focus_change_id = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, 
+        on_focus_changed_main_thread, 
+        data, 
+        [](gpointer user_data) {
+            delete static_cast<FocusChangeData*>(user_data);
+        }
+    );
 }
 
 int main(int argc, char **argv) {
