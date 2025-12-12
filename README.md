@@ -15,6 +15,10 @@ nix build
 
 # Run directly
 nix run . -- /path/to/video.mp4
+
+# Install the package globally
+nix profile add .
+
 ```
 
 ### Manual Build
