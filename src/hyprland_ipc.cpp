@@ -147,6 +147,7 @@ void HyprlandIPC::listen_events() {
         buffer[n] = '\0';
         pending_data.append(buffer);
         
+        bool needs_update = false;
         size_t pos = 0;
         while ((pos = pending_data.find('\n')) != std::string::npos) {
             std::string line = pending_data.substr(0, pos);
@@ -155,15 +156,23 @@ void HyprlandIPC::listen_events() {
             
             if (line.find("openwindow>>") == 0 ||
                 line.find("closewindow>>") == 0 ||
-                line.find("workspace>>") == 0) {
+                line.find("workspace>>") == 0 ||
+                line.find("movewindow>>") == 0 ||
+                line.find("movewindowv2>>") == 0 ||
+                line.find("focusedmon>>") == 0) {
                 
-             
-                usleep(50000);
-                
-                bool empty = is_workspace_empty();
-                if (on_focus_change) {
-                    on_focus_change(!empty);
-                }
+                needs_update = true;
+            }
+        }
+        
+        // Debounce: Only check once per read chunk if relevant events occurred
+        if (needs_update) {
+            // Small sleep to allow window state to settle
+            usleep(50000); 
+            
+            bool empty = is_workspace_empty();
+            if (on_focus_change) {
+                on_focus_change(!empty);
             }
         }
     }
